@@ -1,0 +1,171 @@
+version: "3.9"
+
+name: slurpit
+
+services:
+  slurpit-mariadb:
+    image: mariadb:12-noble
+    container_name: slurpit-mariadb
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    environment:
+      TZ: ${TZ}
+      MARIADB_DATABASE: ${MARIADB_DATABASE}
+      MARIADB_USER: ${MARIADB_USER}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
+      MARIADB_RANDOM_ROOT_PASSWORD: true
+    networks:
+      - slurpit-network
+    volumes:
+      - slurpit-mariadb-data:/var/lib/mysql
+    restart: always
+
+  slurpit-mongodb:
+    image: mongo:8
+    container_name: slurpit-mongodb
+    command: mongod --quiet --logpath /tmp/mongo.log --setParameter logLevel=0
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/27017"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    environment:
+      TZ: ${TZ}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    networks:
+      - slurpit-network
+    volumes:
+      - slurpit-mongodb-data:/data/db
+    restart: always
+      
+  slurpit-warehouse:
+    image: slurpit/warehouse:latest
+    container_name: slurpit-warehouse
+    depends_on:
+      slurpit-mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/services"]
+      interval: 10s
+      timeout: 10s
+      retries: 360
+    networks:
+      - slurpit-network
+    environment:
+      TZ: ${TZ}
+      WAREHOUSE_MONGODB_LOCAL: false
+      WAREHOUSE_PORTAL_URL: http://slurpit-portal
+      WAREHOUSE_MONGODB_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@slurpit-mongodb:27017/${MONGO_DATABASE}?authSource=admin
+    volumes:
+      - slurpit-warehouse-backup:/backup/files
+    restart: always
+
+  slurpit-scraper:
+    image: slurpit/scraper:latest
+    container_name: slurpit-scraper
+    depends_on:
+      slurpit-warehouse:
+        condition: service_healthy
+    networks:
+      - slurpit-network
+    environment:
+      TZ: ${TZ}
+      SCRAPER_POOLSIZE: ${SCRAPER_POOLSIZE}
+      SCRAPER_TIMEOUT: ${SCRAPER_TIMEOUT}
+      SCRAPER_COMMAND_TIMEOUT: ${SCRAPER_COMMAND_TIMEOUT}
+      SCRAPER_WAREHOUSE_HOSTNAME: slurpit-warehouse
+      SCRAPER_POLL_ENABLED: ${SCRAPER_POLL_ENABLED}
+      SCRAPER_POLL_TESTS_ENABLED: ${SCRAPER_POLL_TESTS_ENABLED}
+      SCRAPER_POLL_PROFILER_ENABLED: ${SCRAPER_POLL_PROFILER_ENABLED}
+      SCRAPER_IDENTIFIER: ${SCRAPER_IDENTIFIER}
+      SCRAPER_TAGS: ${SCRAPER_TAGS}
+    restart: always
+
+  slurpit-scanner:
+    image: slurpit/scanner:latest
+    container_name: slurpit-scanner
+    depends_on:
+      slurpit-warehouse:
+        condition: service_healthy
+    networks:
+      - slurpit-network
+    environment:
+      TZ: ${TZ}
+      SCANNER_POOLSIZE: ${SCANNER_POOLSIZE}
+      SCANNER_SNMP_TIMEOUT: ${SCANNER_SNMP_TIMEOUT}
+      SCANNER_SMART_IP_DISCOVERY: ${SCANNER_SMART_IP_DISCOVERY}
+      SCANNER_WAREHOUSE_HOSTNAME: slurpit-warehouse
+      SCANNER_IDENTIFIER: ${SCANNER_IDENTIFIER}
+      SCANNER_TAGS: ${SCANNER_TAGS}
+    restart: always
+
+  slurpit-portal:
+    image: slurpit/portal:latest
+    container_name: slurpit-portal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 10s
+      timeout: 10s
+      retries: 360
+    networks:
+      - slurpit-network
+      # Uncomment below to enable Traefik reverse proxy integration
+      - proxy
+    depends_on:
+      slurpit-mariadb:
+        condition: service_healthy
+      slurpit-warehouse:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      PORTAL_BASE_URL: ${PORTAL_BASE_URL}
+      PORTAL_WAREHOUSE_URL: http://slurpit-warehouse
+      PORTAL_MENU_MODE: ${PORTAL_MENU_MODE}
+      PORTAL_DB_HOSTNAME: ${PORTAL_DB_HOSTNAME}
+      PORTAL_DB_USERNAME: ${PORTAL_DB_USERNAME}
+      PORTAL_DB_PASSWORD: ${PORTAL_DB_PASSWORD}
+    volumes:
+      - slurpit-nginx-logs:/var/log/nginx/
+      - slurpit-php-logs:/var/log/php/
+      - slurpit-certs:/etc/nginx/certs/
+      - slurpit-portal-backup:/backup/files
+    restart: always
+    # Uncomment below to enable Traefik reverse proxy (requires proxy network)
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.slurpit.rule=Host(`${SLURPIT_DOMAIN}`)"
+      - "traefik.http.routers.slurpit.entrypoints=websecure"
+      - "traefik.http.routers.slurpit.tls.certresolver=cf"
+      - "traefik.http.routers.slurpit.service=slurpit"
+      - "traefik.http.services.slurpit.loadbalancer.server.port=80"
+      - "traefik.http.middlewares.slurpit-sec-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.slurpit-sec-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.slurpit-sec-headers.headers.stsPreload=true"
+      - "traefik.http.middlewares.slurpit-sec-headers.headers.referrerPolicy=no-referrer"
+      - "traefik.http.routers.slurpit.middlewares=slurpit-sec-headers@docker"
+      - "traefik.http.middlewares.slurpit-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.slurpit-headers.headers.customrequestheaders.X-Forwarded-Host=${SLURPIT_DOMAIN}"
+      - "traefik.http.routers.slurpit.middlewares=slurpit-sec-headers@docker,slurpit-headers@docker"
+
+volumes:
+  slurpit-mariadb-data:
+  slurpit-mongodb-data:
+  slurpit-warehouse-backup:
+  slurpit-nginx-logs:
+  slurpit-php-logs:
+  slurpit-certs:
+  slurpit-portal-backup:
+
+networks:
+  slurpit-network:
+    driver: bridge
+  # Uncomment below if using Traefik reverse proxy
+  proxy:
+    external: true
+    name: proxy
